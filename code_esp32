@@ -1,0 +1,773 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <FastLED.h>
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION — modifier ici avant flash
+// ═════════════════════════════════════════════════════════════════════════════
+
+#define WIFI_SSID             "mohamed"
+#define WIFI_PASSWORD         "123456785"
+
+#define LED_PIN               5
+#define LED_COUNT             1600
+#define LED_TYPE              WS2812B
+#define COLOR_ORDER           GRB
+#define DEFAULT_BRIGHTNESS    180
+
+#define WIFI_RECONNECT_INTERVAL_MS   5000UL
+#define API_HTTP_TIMEOUT_MS          1500
+#define LED_FRAME_INTERVAL_MS        20UL
+
+// Bornes validation /config
+#define API_INTERVAL_MIN_MS          500UL
+#define PRIORITY_MAX_MS              60000UL
+
+// Taille max du buffer Serial (overflow guard)
+#define SERIAL_BUFFER_MAX            1024
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MODE DE CONTRÔLE
+// ═════════════════════════════════════════════════════════════════════════════
+
+enum ControlMode { MODE_LOCAL_PUSH, MODE_API_PULL, MODE_DUAL };
+
+String modeToString(ControlMode m) {
+  switch (m) {
+    case MODE_LOCAL_PUSH: return "local_push";
+    case MODE_API_PULL:   return "api_pull";
+    case MODE_DUAL:       return "dual";
+    default:              return "unknown";
+  }
+}
+
+ControlMode parseMode(String s) {
+  s.toLowerCase(); s.trim();
+  if (s == "local_push") return MODE_LOCAL_PUSH;
+  if (s == "api_pull")   return MODE_API_PULL;
+  if (s == "dual")       return MODE_DUAL;
+  return (ControlMode)-1;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ÉTAT GLOBAL
+// ═════════════════════════════════════════════════════════════════════════════
+
+CRGB       leds[LED_COUNT];
+WebServer  server(80);
+
+// Mode actif
+ControlMode   controlMode      = MODE_DUAL;
+
+// Config API pull
+String        apiUrl           = "";
+unsigned long apiIntervalMs    = 1000;
+
+// Délais de priorité
+unsigned long directPriorityMs = 5000;   // HTTP local bloque l'API
+unsigned long usbPriorityMs    = 5000;   // USB bloque HTTP + API
+bool          allowHttpDuringUsbPriority = false;
+
+// Timers des dernières commandes
+unsigned long lastDirectCommandMs        = 0;  // dernière commande HTTP locale
+unsigned long lastSerialCommandMs        = 0;  // dernière commande USB
+unsigned long lastApiPollMs              = 0;
+unsigned long lastWifiReconnectAttemptMs = 0;
+
+// Dernier état LED
+String   lastSource      = "none";
+String   lastTemplateId  = "";
+String   lastActionKey   = "";
+uint8_t  lastR           = 0;
+uint8_t  lastG           = 0;
+uint8_t  lastB           = 0;
+uint8_t  lastBrightness  = DEFAULT_BRIGHTNESS;
+uint16_t lastTransitionMs = 500;
+
+// Transition non bloquante
+uint8_t       transR = 0, transG = 0, transB = 0;
+uint8_t       targetR = 0, targetG = 0, targetB = 0;
+uint8_t       targetBrightness = DEFAULT_BRIGHTNESS;
+unsigned long transStart    = 0;
+unsigned long transDuration = 0;
+bool          inTransition  = false;
+unsigned long lastLedFrameMs = 0;
+
+// Buffer USB Serial
+String serialBuffer = "";
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HELPERS — PRIORITÉ
+// ═════════════════════════════════════════════════════════════════════════════
+
+bool isUsbPriorityActive() {
+  return (lastSerialCommandMs > 0 &&
+          (millis() - lastSerialCommandMs) < usbPriorityMs);
+}
+
+bool isLocalPriorityActive() {
+  return (lastDirectCommandMs > 0 &&
+          (millis() - lastDirectCommandMs) < directPriorityMs);
+}
+
+/*
+ * canApplyHttpCommand — vrai si une commande HTTP locale peut être appliquée.
+ * Bloqué si USB priority active ET allowHttpDuringUsbPriority == false.
+ */
+bool canApplyHttpCommand() {
+  if (isUsbPriorityActive() && !allowHttpDuringUsbPriority) return false;
+  return true;
+}
+
+/*
+ * canApplyApiCommand — vrai si l'API peut écrire les LEDs.
+ * Bloqué par USB priority ou HTTP local priority.
+ */
+bool canApplyApiCommand() {
+  if (isUsbPriorityActive())    return false;
+  if (isLocalPriorityActive())  return false;
+  return true;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LED — APPLICATION ET TRANSITION
+// ═════════════════════════════════════════════════════════════════════════════
+
+void applyColor(uint8_t r, uint8_t g, uint8_t b,
+                uint8_t brightness, uint16_t transitionMs) {
+  lastR            = r;
+  lastG            = g;
+  lastB            = b;
+  lastBrightness   = brightness;
+  lastTransitionMs = transitionMs;
+
+  if (transitionMs == 0) {
+    inTransition = false;
+    FastLED.setBrightness(brightness);
+    fill_solid(leds, LED_COUNT, CRGB(r, g, b));
+    FastLED.show();
+    lastLedFrameMs = millis();
+  } else {
+    transR = leds[0].r;
+    transG = leds[0].g;
+    transB = leds[0].b;
+    targetR          = r;
+    targetG          = g;
+    targetB          = b;
+    targetBrightness = brightness;
+    transStart       = millis();
+    transDuration    = transitionMs;
+    inTransition     = true;
+  }
+}
+
+void updateTransition() {
+  if (!inTransition) return;
+  unsigned long now = millis();
+  if (now - lastLedFrameMs < LED_FRAME_INTERVAL_MS) return;
+  lastLedFrameMs = now;
+
+  unsigned long elapsed = now - transStart;
+  if (elapsed >= transDuration) {
+    inTransition = false;
+    FastLED.setBrightness(targetBrightness);
+    fill_solid(leds, LED_COUNT, CRGB(targetR, targetG, targetB));
+    FastLED.show();
+    Serial.println("[LED] Transition complete.");
+    return;
+  }
+  float t  = (float)elapsed / (float)transDuration;
+  uint8_t r = (uint8_t)(transR + t * ((int)targetR - (int)transR));
+  uint8_t g = (uint8_t)(transG + t * ((int)targetG - (int)transG));
+  uint8_t b = (uint8_t)(transB + t * ((int)targetB - (int)transB));
+  FastLED.setBrightness(targetBrightness);
+  fill_solid(leds, LED_COUNT, CRGB(r, g, b));
+  FastLED.show();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HELPER — APPLIQUER COULEUR DEPUIS JsonDocument
+// ═════════════════════════════════════════════════════════════════════════════
+
+/*
+ * applyColorFromDoc — lit r/g/b/brightness/transition_ms depuis un doc JSON
+ * déjà parsé, valide et applique. Retourne false si RGB invalide.
+ * source : "local_push" | "serial_usb" | "api_pull"
+ */
+bool applyColorFromDoc(JsonDocument& doc, const char* source,
+                       String templateId, String actionKey) {
+  int r = doc["r"] | -1;
+  int g = doc["g"] | -1;
+  int b = doc["b"] | -1;
+  if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) return false;
+
+  uint8_t  brightness = (uint8_t)constrain(
+    doc["brightness"] | (int)DEFAULT_BRIGHTNESS, 0, 255);
+  uint16_t transMs    = (uint16_t)(doc["transition_ms"] | 500);
+
+  applyColor((uint8_t)r, (uint8_t)g, (uint8_t)b, brightness, transMs);
+  lastSource     = source;
+  lastTemplateId = templateId;
+  lastActionKey  = actionKey;
+  return true;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// JSON + CORS HELPERS HTTP
+// ═════════════════════════════════════════════════════════════════════════════
+
+void addCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin",  "*");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+}
+
+void sendJson(int statusCode, JsonDocument& doc) {
+  String body;
+  serializeJson(doc, body);
+  addCorsHeaders();
+  server.send(statusCode, "application/json", body);
+}
+
+void sendError(int statusCode, const char* error, const char* message = nullptr) {
+  StaticJsonDocument<128> doc;
+  doc["success"] = false;
+  doc["error"]   = error;
+  if (message) doc["message"] = message;
+  String body;
+  serializeJson(doc, body);
+  addCorsHeaders();
+  server.send(statusCode, "application/json", body);
+}
+
+void handleOptions() {
+  addCorsHeaders();
+  server.send(204);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HELPER — SÉRIALISER CONFIG
+// ═════════════════════════════════════════════════════════════════════════════
+
+/*
+ * Applique et valide les champs de config communs à HTTP /config
+ * et à la commande USB {"cmd":"config",...}.
+ * Retourne une chaîne d'erreur ou "" si OK.
+ */
+String applyConfigFromDoc(JsonDocument& doc) {
+  if (doc.containsKey("mode")) {
+    ControlMode nm = parseMode(doc["mode"].as<String>());
+    if ((int)nm == -1) return "invalid_mode";
+    controlMode = nm;
+  }
+  if (doc.containsKey("api_url")) {
+    apiUrl = doc["api_url"].as<String>();
+    apiUrl.trim();
+  }
+  if (doc.containsKey("api_interval_ms")) {
+    long v = doc["api_interval_ms"].as<long>();
+    if (v < (long)API_INTERVAL_MIN_MS) return "invalid_api_interval_ms";
+    apiIntervalMs = (unsigned long)v;
+  }
+  if (doc.containsKey("direct_priority_ms")) {
+    long v = doc["direct_priority_ms"].as<long>();
+    if (v < 0 || (unsigned long)v > PRIORITY_MAX_MS) return "invalid_direct_priority_ms";
+    directPriorityMs = (unsigned long)v;
+  }
+  if (doc.containsKey("usb_priority_ms")) {
+    long v = doc["usb_priority_ms"].as<long>();
+    if (v < 0 || (unsigned long)v > PRIORITY_MAX_MS) return "invalid_usb_priority_ms";
+    usbPriorityMs = (unsigned long)v;
+  }
+  if (doc.containsKey("allow_http_during_usb_priority")) {
+    allowHttpDuringUsbPriority = doc["allow_http_during_usb_priority"].as<bool>();
+  }
+  return "";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HANDLERS HTTP
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── GET / ─────────────────────────────────────────────────────────────────────
+void handleRoot() {
+  StaticJsonDocument<256> doc;
+  doc["device"] = "lumabooth_esp32_led_v3";
+  JsonArray routes = doc.createNestedArray("routes");
+  routes.add("/"); routes.add("/ping"); routes.add("/status");
+  routes.add("/set-color"); routes.add("/config"); routes.add("/off");
+  sendJson(200, doc);
+}
+
+// ── GET /ping ─────────────────────────────────────────────────────────────────
+void handlePing() {
+  StaticJsonDocument<128> doc;
+  doc["success"] = true;
+  doc["message"] = "pong";
+  doc["device"]  = "lumabooth_esp32_led_v3";
+  sendJson(200, doc);
+}
+
+// ── GET /status ───────────────────────────────────────────────────────────────
+void handleStatus() {
+  StaticJsonDocument<1024> doc;
+  doc["success"]                        = true;
+  doc["mode"]                           = modeToString(controlMode);
+  doc["wifi_connected"]                 = (WiFi.status() == WL_CONNECTED);
+  doc["ip"]                             = (WiFi.status() == WL_CONNECTED)
+                                            ? WiFi.localIP().toString()
+                                            : String("");
+  doc["api_url"]                        = apiUrl;
+  doc["api_interval_ms"]                = apiIntervalMs;
+  doc["direct_priority_ms"]             = directPriorityMs;
+  doc["usb_priority_ms"]                = usbPriorityMs;
+  doc["allow_http_during_usb_priority"] = allowHttpDuringUsbPriority;
+  doc["serial_enabled"]                 = true;
+  doc["last_source"]                    = lastSource;
+  doc["last_r"]                         = lastR;
+  doc["last_g"]                         = lastG;
+  doc["last_b"]                         = lastB;
+  doc["last_brightness"]                = lastBrightness;
+  doc["last_template_id"]               = lastTemplateId;
+  doc["last_action_key"]                = lastActionKey;
+  doc["in_transition"]                  = inTransition;
+  doc["uptime_ms"]                      = millis();
+
+  unsigned long now = millis();
+  doc["usb_priority_active"]   = isUsbPriorityActive();
+  doc["local_priority_active"] = isLocalPriorityActive();
+
+  if (isUsbPriorityActive()) {
+    unsigned long e = now - lastSerialCommandMs;
+    doc["usb_priority_remaining_ms"] = usbPriorityMs - e;
+  }
+  if (isLocalPriorityActive()) {
+    unsigned long e = now - lastDirectCommandMs;
+    doc["direct_priority_remaining_ms"] = directPriorityMs - e;
+  }
+  sendJson(200, doc);
+}
+
+// ── POST /set-color ───────────────────────────────────────────────────────────
+void handleSetColor() {
+  if (!server.hasArg("plain")) {
+    sendError(400, "invalid_json"); return;
+  }
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    Serial.println("[HTTP] /set-color — JSON parse error");
+    sendError(400, "invalid_json"); return;
+  }
+
+  // Vérifier priorité USB
+  if (!canApplyHttpCommand()) {
+    Serial.println("[HTTP] ignored because USB priority active");
+    sendError(409, "usb_priority_active",
+              "USB priority is active, HTTP command ignored");
+    return;
+  }
+
+  String templateId = doc["template_id"] | "";
+  String actionKey  = doc["action_key"]  | "";
+
+  if (!applyColorFromDoc(doc, "local_push", templateId, actionKey)) {
+    Serial.println("[HTTP] /set-color — invalid RGB");
+    sendError(400, "invalid_rgb"); return;
+  }
+
+  lastDirectCommandMs = millis();
+  Serial.printf("[HTTP] color applied — r=%d g=%d b=%d br=%d tpl=%s\n",
+                lastR, lastG, lastB, lastBrightness, templateId.c_str());
+
+  StaticJsonDocument<192> resp;
+  resp["success"]    = true;
+  resp["mode"]       = modeToString(controlMode);
+  resp["message"]    = "color applied";
+  resp["r"]          = lastR;
+  resp["g"]          = lastG;
+  resp["b"]          = lastB;
+  resp["brightness"] = lastBrightness;
+  sendJson(200, resp);
+}
+
+// ── POST /config ──────────────────────────────────────────────────────────────
+void handleConfig() {
+  if (!server.hasArg("plain")) {
+    sendError(400, "invalid_json"); return;
+  }
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    sendError(400, "invalid_json"); return;
+  }
+  String err = applyConfigFromDoc(doc);
+  if (err.length() > 0) { sendError(400, err.c_str()); return; }
+
+  Serial.printf("[CONFIG] updated — mode=%s api=%s interval=%lums "
+                "direct_pr=%lums usb_pr=%lums allow_http=%d\n",
+                modeToString(controlMode).c_str(), apiUrl.c_str(),
+                apiIntervalMs, directPriorityMs, usbPriorityMs,
+                (int)allowHttpDuringUsbPriority);
+
+  StaticJsonDocument<512> resp;
+  resp["success"]                        = true;
+  resp["mode"]                           = modeToString(controlMode);
+  resp["api_url"]                        = apiUrl;
+  resp["api_interval_ms"]                = apiIntervalMs;
+  resp["direct_priority_ms"]             = directPriorityMs;
+  resp["usb_priority_ms"]                = usbPriorityMs;
+  resp["allow_http_during_usb_priority"] = allowHttpDuringUsbPriority;
+  sendJson(200, resp);
+}
+
+// ── POST /off ─────────────────────────────────────────────────────────────────
+void handleOff() {
+  inTransition = false;
+  FastLED.setBrightness(0);
+  fill_solid(leds, LED_COUNT, CRGB::Black);
+  FastLED.show();
+  lastSource     = "off";
+  lastR = lastG = lastB = lastBrightness = 0;
+  lastTemplateId = "";
+  lastActionKey  = "off";
+  Serial.println("[LED] off");
+
+  StaticJsonDocument<96> resp;
+  resp["success"] = true;
+  resp["message"] = "led off";
+  sendJson(200, resp);
+}
+
+// ── 404 / OPTIONS ─────────────────────────────────────────────────────────────
+void handleNotFound() {
+  if (server.method() == HTTP_OPTIONS) { handleOptions(); return; }
+  sendError(404, "not_found");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// USB SERIAL — TRAITEMENT
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Sérialise et envoie une réponse JSON sur Serial (une ligne)
+void serialSendJson(JsonDocument& doc) {
+  String out;
+  serializeJson(doc, out);
+  Serial.println(out);
+}
+
+void serialSendError(const char* error) {
+  StaticJsonDocument<128> doc;
+  doc["success"] = false;
+  doc["source"]  = "serial_usb";
+  doc["error"]   = error;
+  serialSendJson(doc);
+}
+
+/*
+ * processSerialJson — appelée quand une ligne complète est reçue sur USB.
+ * Parse le JSON, identifie le cmd, agit, répond sur Serial.
+ */
+void processSerialJson(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+
+  StaticJsonDocument<768> doc;
+  DeserializationError err = deserializeJson(doc, line);
+  if (err) {
+    Serial.println("[USB] invalid JSON");
+    serialSendError("invalid_json");
+    return;
+  }
+
+  String cmd = doc["cmd"] | "";
+  cmd.toLowerCase();
+
+  // ── cmd: status ───────────────────────────────────────────────────────────
+  if (cmd == "status") {
+    StaticJsonDocument<1024> resp;
+    resp["success"]                        = true;
+    resp["source"]                         = "serial_usb";
+    resp["mode"]                           = modeToString(controlMode);
+    resp["wifi_connected"]                 = (WiFi.status() == WL_CONNECTED);
+    resp["ip"]                             = (WiFi.status() == WL_CONNECTED)
+                                               ? WiFi.localIP().toString()
+                                               : String("");
+    resp["api_url"]                        = apiUrl;
+    resp["api_interval_ms"]                = apiIntervalMs;
+    resp["direct_priority_ms"]             = directPriorityMs;
+    resp["usb_priority_ms"]                = usbPriorityMs;
+    resp["allow_http_during_usb_priority"] = allowHttpDuringUsbPriority;
+    resp["serial_enabled"]                 = true;
+    resp["last_source"]                    = lastSource;
+    resp["last_r"]                         = lastR;
+    resp["last_g"]                         = lastG;
+    resp["last_b"]                         = lastB;
+    resp["last_brightness"]                = lastBrightness;
+    resp["last_template_id"]               = lastTemplateId;
+    resp["last_action_key"]                = lastActionKey;
+    resp["uptime_ms"]                      = millis();
+    resp["usb_priority_active"]            = isUsbPriorityActive();
+    resp["local_priority_active"]          = isLocalPriorityActive();
+    serialSendJson(resp);
+    return;
+  }
+
+  // ── cmd: set-color ────────────────────────────────────────────────────────
+  if (cmd == "set-color") {
+    String templateId = doc["template_id"] | "";
+    String actionKey  = doc["action_key"]  | "";
+
+    if (!applyColorFromDoc(doc, "serial_usb", templateId, actionKey)) {
+      Serial.println("[USB] invalid RGB");
+      serialSendError("invalid_rgb");
+      return;
+    }
+
+    // USB a la priorité 1 : met à jour lastSerialCommandMs
+    lastSerialCommandMs = millis();
+    Serial.printf("[USB] color applied — r=%d g=%d b=%d br=%d tpl=%s\n",
+                  lastR, lastG, lastB, lastBrightness, templateId.c_str());
+
+    StaticJsonDocument<192> resp;
+    resp["success"]    = true;
+    resp["source"]     = "serial_usb";
+    resp["message"]    = "color applied";
+    resp["r"]          = lastR;
+    resp["g"]          = lastG;
+    resp["b"]          = lastB;
+    resp["brightness"] = lastBrightness;
+    serialSendJson(resp);
+    return;
+  }
+
+  // ── cmd: off ──────────────────────────────────────────────────────────────
+  if (cmd == "off") {
+    inTransition = false;
+    FastLED.setBrightness(0);
+    fill_solid(leds, LED_COUNT, CRGB::Black);
+    FastLED.show();
+    lastSource     = "off";
+    lastR = lastG = lastB = lastBrightness = 0;
+    lastTemplateId = "";
+    lastActionKey  = "off";
+    lastSerialCommandMs = millis();   // off USB = priorité USB active
+    Serial.println("[USB] off");
+
+    StaticJsonDocument<96> resp;
+    resp["success"] = true;
+    resp["source"]  = "serial_usb";
+    resp["message"] = "led off";
+    serialSendJson(resp);
+    return;
+  }
+
+  // ── cmd: config ───────────────────────────────────────────────────────────
+  if (cmd == "config") {
+    String errStr = applyConfigFromDoc(doc);
+    if (errStr.length() > 0) {
+      serialSendError(errStr.c_str()); return;
+    }
+    Serial.printf("[USB][CONFIG] updated — mode=%s interval=%lums "
+                  "direct_pr=%lums usb_pr=%lums\n",
+                  modeToString(controlMode).c_str(),
+                  apiIntervalMs, directPriorityMs, usbPriorityMs);
+
+    StaticJsonDocument<512> resp;
+    resp["success"]                        = true;
+    resp["source"]                         = "serial_usb";
+    resp["mode"]                           = modeToString(controlMode);
+    resp["api_url"]                        = apiUrl;
+    resp["api_interval_ms"]                = apiIntervalMs;
+    resp["direct_priority_ms"]             = directPriorityMs;
+    resp["usb_priority_ms"]                = usbPriorityMs;
+    resp["allow_http_during_usb_priority"] = allowHttpDuringUsbPriority;
+    serialSendJson(resp);
+    return;
+  }
+
+  // ── cmd inconnu ───────────────────────────────────────────────────────────
+  Serial.printf("[USB] unknown cmd: %s\n", cmd.c_str());
+  serialSendError("unknown_cmd");
+}
+
+/*
+ * handleSerialCommands — appelé dans loop(), non bloquant.
+ * Lit les octets disponibles, accumule dans serialBuffer,
+ * traite chaque ligne complète (\n).
+ */
+void handleSerialCommands() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+
+    if (c == '\n') {
+      processSerialJson(serialBuffer);
+      serialBuffer = "";
+    } else {
+      serialBuffer += c;
+      // Protection overflow
+      if (serialBuffer.length() >= SERIAL_BUFFER_MAX) {
+        Serial.println("[USB] buffer overflow — flushed");
+        serialSendError("buffer_overflow");
+        serialBuffer = "";
+      }
+    }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// API PULL
+// ═════════════════════════════════════════════════════════════════════════════
+
+void pollApiIfNeeded() {
+  if (apiUrl.length() == 0) return;
+  if (controlMode == MODE_LOCAL_PUSH) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  unsigned long now = millis();
+  if (now - lastApiPollMs < apiIntervalMs) return;
+  lastApiPollMs = now;
+
+  if (!canApplyApiCommand()) {
+    if (isUsbPriorityActive())
+      Serial.println("[API] ignored because USB priority active");
+    else
+      Serial.println("[API] ignored because local_push priority active");
+    return;
+  }
+
+  HTTPClient http;
+  if (!http.begin(apiUrl)) {
+    Serial.printf("[API] http.begin() failed for: %s\n", apiUrl.c_str());
+    return;
+  }
+  http.setTimeout(API_HTTP_TIMEOUT_MS);
+
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[API] GET %s — HTTP %d, keeping last color.\n",
+                  apiUrl.c_str(), code);
+    http.end(); return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  StaticJsonDocument<384> doc;
+  if (deserializeJson(doc, payload)) {
+    Serial.println("[API] JSON parse error, keeping last color.");
+    return;
+  }
+  if (!doc["success"].as<bool>()) {
+    Serial.println("[API] success=false, keeping last color.");
+    return;
+  }
+
+  // Skip si même couleur API déjà active
+  int r = doc["r"] | -1;
+  int g = doc["g"] | -1;
+  int b = doc["b"] | -1;
+  if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) {
+    Serial.println("[API] invalid RGB, keeping last color.");
+    return;
+  }
+  uint8_t brightness = (uint8_t)constrain(
+    doc["brightness"] | (int)DEFAULT_BRIGHTNESS, 0, 255);
+  if ((uint8_t)r == lastR && (uint8_t)g == lastG && (uint8_t)b == lastB
+      && brightness == lastBrightness && lastSource == "api_pull") return;
+
+  String tplId  = doc["template_id"] | "";
+  String actKey = doc["action_key"]  | "";
+
+  applyColorFromDoc(doc, "api_pull", tplId, actKey);
+  Serial.printf("[API] color applied — r=%d g=%d b=%d br=%d tpl=%s\n",
+                lastR, lastG, lastB, lastBrightness, tplId.c_str());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// WI-FI
+// ═════════════════════════════════════════════════════════════════════════════
+
+void connectWifi() {
+  Serial.printf("[WIFI] Connecting to \"%s\"", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // delay() accepté ici — uniquement au boot, jamais dans loop()
+  uint8_t attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500); Serial.print("."); attempts++;
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WIFI] connected — IP: %s\n",
+                  WiFi.localIP().toString().c_str());
+  } else {
+    Serial.printf("[WIFI] initial connection failed — retrying every %lums in loop.\n",
+                  WIFI_RECONNECT_INTERVAL_MS);
+  }
+}
+
+void handleWifiReconnect() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  unsigned long now = millis();
+  if (now - lastWifiReconnectAttemptMs < WIFI_RECONNECT_INTERVAL_MS) return;
+  lastWifiReconnectAttemptMs = now;
+  Serial.println("[WIFI] reconnect attempt...");
+  WiFi.reconnect();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SETUP
+// ═════════════════════════════════════════════════════════════════════════════
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n[BOOT] lumabooth_led_v3 starting...");
+  Serial.println("[BOOT] Transports: HTTP local + API pull + USB Serial");
+
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, LED_COUNT)
+         .setCorrection(TypicalLEDStrip);
+  FastLED.setBrightness(0);
+  fill_solid(leds, LED_COUNT, CRGB::Black);
+  FastLED.show();
+  Serial.printf("[LED] FastLED ready — %d LEDs on GPIO %d\n",
+                LED_COUNT, LED_PIN);
+
+  connectWifi();
+
+  server.on("/",          HTTP_GET,     handleRoot);
+  server.on("/",          HTTP_OPTIONS, handleOptions);
+  server.on("/ping",      HTTP_GET,     handlePing);
+  server.on("/ping",      HTTP_OPTIONS, handleOptions);
+  server.on("/status",    HTTP_GET,     handleStatus);
+  server.on("/status",    HTTP_OPTIONS, handleOptions);
+  server.on("/set-color", HTTP_POST,    handleSetColor);
+  server.on("/set-color", HTTP_OPTIONS, handleOptions);
+  server.on("/config",    HTTP_POST,    handleConfig);
+  server.on("/config",    HTTP_OPTIONS, handleOptions);
+  server.on("/off",       HTTP_POST,    handleOff);
+  server.on("/off",       HTTP_OPTIONS, handleOptions);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("[HTTP] server started on port 80");
+
+  Serial.printf("[BOOT] mode=%s | direct_pr=%lums | usb_pr=%lums | "
+                "allow_http_usb=%d\n",
+                modeToString(controlMode).c_str(),
+                directPriorityMs, usbPriorityMs,
+                (int)allowHttpDuringUsbPriority);
+  Serial.println("[BOOT] ready. USB Serial active at 115200 baud.");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LOOP — entièrement non bloquant
+// ═════════════════════════════════════════════════════════════════════════════
+
+void loop() {
+  handleWifiReconnect();    // reconnexion Wi-Fi si perdu (non bloquant)
+  server.handleClient();    // requêtes HTTP entrantes
+  updateTransition();       // fondu LED throttlé à LED_FRAME_INTERVAL_MS
+  pollApiIfNeeded();        // appel API si intervalle écoulé
+  handleSerialCommands();   // lecture USB Serial caractère par caractère
+}
