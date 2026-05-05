@@ -1,0 +1,650 @@
+"""
+windows_esp32_color_simulator.py
+─────────────────────────────────────────────────────────────────────────────
+Simulateur Windows pour tester le firmware ESP32 lumabooth_led_v3.
+
+Simule les changements de template LumaBooth depuis un PC Windows,
+sans Mac, sans LumaBooth, sans LumaBooth AX Watcher.
+
+Dépendances : pip install -r requirements_windows_simulator.txt
+─────────────────────────────────────────────────────────────────────────────
+"""
+
+import json
+import sys
+import time
+import datetime
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [SIM] %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("sim")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION — modifier ici
+# ─────────────────────────────────────────────────────────────────────────────
+
+ESP32_URL    = "http://10.95.0.107"   # IP de votre ESP32
+SERIAL_PORT  = "COM15"                  # port COM USB de l'ESP32
+SERIAL_BAUD  = 115200
+HTTP_TIMEOUT = 2                       # secondes
+
+# Paramètres API distante (envoyés à l'ESP32 via /config ou cmd:config)
+API_URL                        = "8"
+API_INTERVAL_MS                = 1000
+DIRECT_PRIORITY_MS             = 5000
+USB_PRIORITY_MS                = 5000
+ALLOW_HTTP_DURING_USB_PRIORITY = False
+
+# Mapping des effets LumaBooth → couleurs LED
+EFFECTS = {
+    0: {
+        "label":      "Effect 1",
+        "color_hex":  "#FF0000",
+        "r": 255, "g": 0,   "b": 0,
+        "video":      "video-1.mp4",
+    },
+    1: {
+        "label":      "Effect 2",
+        "color_hex":  "#00FF00",
+        "r": 0,   "g": 255, "b": 0,
+        "video":      "video-2.mp4",
+    },
+    2: {
+        "label":      "Effect 3",
+        "color_hex":  "#0000FF",
+        "r": 0,   "g": 0,   "b": 255,
+        "video":      "video-3.mp4",
+    },
+    3: {
+        "label":      "Effect 4",
+        "color_hex":  "#FFFF00",
+        "r": 255, "g": 255, "b": 0,
+        "video":      "video-4.mp4",
+    },
+}
+
+BRIGHTNESS_DEFAULT   = 180
+TRANSITION_MS        = 500
+SESSION_GENERATION   = 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPORTS OPTIONNELS
+# ─────────────────────────────────────────────────────────────────────────────
+
+try:
+    import requests as _requests
+    _HTTP_OK = True
+except ImportError:
+    _HTTP_OK = False
+    log.warning("'requests' non installé — mode HTTP indisponible. "
+                "Exécuter : pip install requests")
+
+try:
+    import serial as _serial
+    import serial.tools.list_ports as _list_ports
+    _SERIAL_OK = True
+except ImportError:
+    _SERIAL_OK = False
+    log.warning("'pyserial' non installé — mode USB indisponible. "
+                "Exécuter : pip install pyserial")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ÉTAT GLOBAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+_serial_conn = None   # connexion série persistante
+_action_counter = 0
+
+def _next_action_key(trigger: str, index: int) -> str:
+    global _action_counter
+    _action_counter += 1
+    return f"sim:{_action_counter}:{trigger}:{index}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTRUCTION DU PAYLOAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_http_payload(index: int, trigger: str = "index_change") -> dict:
+    """Construit un payload HTTP identique à celui du watcher Mac."""
+    eff = EFFECTS[index]
+    return {
+        "source":             "windows_simulator",
+        "template_id":        f"lumabooth_index_{index}",
+        "selected_index":     index,
+        "action_index":       index,
+        "label":              eff["label"],
+        "color_hex":          eff["color_hex"],
+        "r":                  eff["r"],
+        "g":                  eff["g"],
+        "b":                  eff["b"],
+        "brightness":         BRIGHTNESS_DEFAULT,
+        "transition_ms":      TRANSITION_MS,
+        "trigger":            trigger,
+        "session_generation": SESSION_GENERATION,
+        "action_key":         _next_action_key(trigger, index),
+        "timestamp":          datetime.datetime.now().isoformat(),
+    }
+
+def build_serial_payload(index: int, trigger: str = "index_change") -> dict:
+    """Payload USB = payload HTTP + champ cmd."""
+    p = build_http_payload(index, trigger)
+    p["cmd"] = "set-color"
+    return p
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSPORT HTTP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def http_get(path: str) -> tuple:
+    """GET ESP32_URL/path. Retourne (ok, data_or_msg)."""
+    if not _HTTP_OK:
+        return (False, "requests non installé")
+    url = ESP32_URL.rstrip("/") + path
+    try:
+        r = _requests.get(url, timeout=HTTP_TIMEOUT)
+        data = r.json() if r.headers.get("Content-Type","").startswith("application/json") else r.text
+        return (r.status_code == 200, data)
+    except _requests.exceptions.ConnectionError:
+        return (False, f"Connexion refusée — ESP32 injoignable ({url})")
+    except _requests.exceptions.Timeout:
+        return (False, f"Timeout ({HTTP_TIMEOUT}s)")
+    except Exception as e:
+        return (False, str(e))
+
+def http_post(path: str, payload: dict) -> tuple:
+    """POST JSON vers ESP32_URL/path. Retourne (ok, data_or_msg)."""
+    if not _HTTP_OK:
+        return (False, "requests non installé")
+    url = ESP32_URL.rstrip("/") + path
+    try:
+        r = _requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+        data = r.json() if r.headers.get("Content-Type","").startswith("application/json") else r.text
+        return (r.status_code in (200, 201), data)
+    except _requests.exceptions.ConnectionError:
+        return (False, f"Connexion refusée — ESP32 injoignable ({url})")
+    except _requests.exceptions.Timeout:
+        return (False, f"Timeout ({HTTP_TIMEOUT}s)")
+    except Exception as e:
+        return (False, str(e))
+
+def print_http_result(ok: bool, data) -> None:
+    if ok:
+        log.info(f"HTTP OK → {data}")
+    else:
+        log.error(f"HTTP ERREUR → {data}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSPORT USB SERIAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def list_serial_ports() -> list:
+    """Liste les ports COM disponibles sur Windows."""
+    if not _SERIAL_OK:
+        return []
+    return [p.device for p in _list_ports.comports()]
+
+def serial_connect(port: str = None) -> bool:
+    """Ouvre la connexion série persistante. Retourne True si OK."""
+    global _serial_conn
+    target = port or SERIAL_PORT
+    if not _SERIAL_OK:
+        log.error("pyserial non installé")
+        return False
+    try:
+        if _serial_conn and _serial_conn.is_open:
+            _serial_conn.close()
+        conn = _serial.Serial()
+        conn.port     = target
+        conn.baudrate = SERIAL_BAUD
+        conn.timeout  = 2
+        # Désactiver DTR/RTS pour éviter reset ESP32 à l'ouverture
+        conn.dtr = False
+        conn.rts = False
+        conn.open()
+        conn.dtr = False
+        conn.rts = False
+        time.sleep(0.1)
+        conn.reset_input_buffer()
+        _serial_conn = conn
+        log.info(f"Port {target} ouvert à {SERIAL_BAUD} bauds")
+        return True
+    except _serial.SerialException as e:
+        log.error(f"Impossible d'ouvrir {target}: {e}")
+        return False
+    except Exception as e:
+        log.error(f"Erreur ouverture série: {e}")
+        return False
+
+def serial_send_cmd(cmd_dict: dict) -> tuple:
+    """
+    Envoie une commande JSON sur le port série.
+    Retourne (ok, message).
+    """
+    global _serial_conn
+    if not _SERIAL_OK:
+        return (False, "pyserial non installé")
+    if _serial_conn is None or not _serial_conn.is_open:
+        log.warning("Port série non ouvert — tentative de connexion...")
+        if not serial_connect():
+            return (False, "Port série inaccessible")
+
+    line = json.dumps(cmd_dict, separators=(",", ":")) + "\n"
+    try:
+        _serial_conn.reset_input_buffer()
+        _serial_conn.write(line.encode("utf-8"))
+        _serial_conn.flush()
+    except Exception as e:
+        _serial_conn = None
+        return (False, f"Erreur écriture: {e}")
+
+    # Lire la réponse — ignorer les lignes de log [WIFI], [LED], etc.
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        try:
+            raw = _serial_conn.readline()
+        except Exception as e:
+            return (False, f"Erreur lecture: {e}")
+        if not raw:
+            continue
+        text = raw.decode("utf-8", errors="replace").strip()
+        if not text or text.startswith("["):
+            continue   # ligne de log ESP32, ignorer
+        try:
+            data = json.loads(text)
+            if "success" in data:
+                return (data["success"], data)
+        except json.JSONDecodeError:
+            continue
+
+    return (False, "Pas de réponse JSON (timeout)")
+
+def print_serial_result(ok: bool, data) -> None:
+    if ok:
+        log.info(f"USB OK → {data}")
+    else:
+        log.error(f"USB ERREUR → {data}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACTIONS MENU
+# ─────────────────────────────────────────────────────────────────────────────
+
+def action_ping_http():
+    print("\n[HTTP] GET /ping")
+    ok, data = http_get("/ping")
+    print_http_result(ok, data)
+
+def action_effect_http(index: int, trigger: str = "index_change"):
+    eff = EFFECTS[index]
+    print(f"\n[HTTP] Effect {index+1} — {eff['label']} {eff['color_hex']}")
+    payload = build_http_payload(index, trigger)
+    ok, data = http_post("/set-color", payload)
+    print_http_result(ok, data)
+
+def action_off_http():
+    print("\n[HTTP] POST /off")
+    ok, data = http_post("/off", {})
+    print_http_result(ok, data)
+
+def action_effect_usb(index: int, trigger: str = "index_change"):
+    eff = EFFECTS[index]
+    print(f"\n[USB] Effect {index+1} — {eff['label']} {eff['color_hex']}")
+    payload = build_serial_payload(index, trigger)
+    ok, data = serial_send_cmd(payload)
+    print_serial_result(ok, data)
+
+def action_off_usb():
+    print("\n[USB] cmd: off")
+    ok, data = serial_send_cmd({"cmd": "off"})
+    print_serial_result(ok, data)
+
+def action_status_usb():
+    print("\n[USB] cmd: status")
+    ok, data = serial_send_cmd({"cmd": "status"})
+    print_serial_result(ok, data)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACTIONS — API DISTANTE / CONFIGURATION ESP32
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_config_payload(mode: str) -> dict:
+    """Construit le payload /config avec les paramètres API actuels."""
+    return {
+        "mode":                           mode,
+        "api_url":                        API_URL,
+        "api_interval_ms":                API_INTERVAL_MS,
+        "direct_priority_ms":             DIRECT_PRIORITY_MS,
+        "usb_priority_ms":                USB_PRIORITY_MS,
+        "allow_http_during_usb_priority": ALLOW_HTTP_DURING_USB_PRIORITY,
+    }
+
+def action_config_api_http(mode: str = "dual"):
+    """19 — Configure l'API distante sur l'ESP32 via HTTP POST /config."""
+    payload = _build_config_payload(mode)
+    print(f"\n[HTTP] POST /config — mode={mode} api_url={API_URL}")
+    ok, data = http_post("/config", payload)
+    print_http_result(ok, data)
+
+def action_config_api_usb(mode: str = "dual"):
+    """20 — Configure l'API distante sur l'ESP32 via USB cmd:config."""
+    payload = _build_config_payload(mode)
+    payload["cmd"] = "config"
+    print(f"\n[USB] cmd:config — mode={mode} api_url={API_URL}")
+    ok, data = serial_send_cmd(payload)
+    print_serial_result(ok, data)
+
+def action_set_mode_http(mode: str):
+    """Envoie le mode choisi + URL API actuelle via HTTP."""
+    payload = _build_config_payload(mode)
+    print(f"\n[HTTP] POST /config — mode={mode}")
+    ok, data = http_post("/config", payload)
+    print_http_result(ok, data)
+
+def action_set_mode_usb(mode: str):
+    """Envoie le mode choisi + URL API actuelle via USB."""
+    payload = _build_config_payload(mode)
+    payload["cmd"] = "config"
+    print(f"\n[USB] cmd:config — mode={mode}")
+    ok, data = serial_send_cmd(payload)
+    print_serial_result(ok, data)
+
+def action_show_esp32_status():
+    """28 — GET /status et affiche les champs essentiels."""
+    print("\n[HTTP] GET /status")
+    ok, data = http_get("/status")
+    if not ok:
+        print_http_result(ok, data)
+        return
+    fields = [
+        "mode", "api_url", "api_interval_ms", "direct_priority_ms",
+        "usb_priority_ms", "last_source", "wifi_connected",
+        "usb_priority_active", "local_priority_active",
+        "last_r", "last_g", "last_b", "last_brightness",
+        "last_template_id", "uptime_ms",
+    ]
+    print()
+    print("  ┌─ Configuration ESP32 ─────────────────────────────")
+    if isinstance(data, dict):
+        for f in fields:
+            if f in data:
+                print(f"  │  {f:<34} = {data[f]}")
+    else:
+        print(f"  │  {data}")
+    print("  └───────────────────────────────────────────────────")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCÉNARIO AUTOMATIQUE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_scenario_http():
+    """
+    Simule une session LumaBooth complète via HTTP :
+      accueil Effect 1 → Effect 2 → Effect 4 → session photo → accueil → off
+    """
+    print("\n" + "═"*60)
+    print("SCÉNARIO AUTOMATIQUE HTTP")
+    print("═"*60)
+
+    steps = [
+        ("initial accueil",    0, "initial",      2),
+        ("template change",    1, "index_change", 2),
+        ("template change",    3, "index_change", 2),
+        ("session photo",     -1, "in_session",   3),  # -1 = pas d'envoi
+        ("reset accueil",      0, "reset_idle",   2),
+        ("off",               -2, "off",          0),   # -2 = /off
+    ]
+
+    for label, idx, trigger, wait in steps:
+        print(f"\n  ▶ {label}")
+        if idx == -1:
+            log.info(f"[SIM] {label} — aucune commande LED envoyée")
+        elif idx == -2:
+            action_off_http()
+        else:
+            action_effect_http(idx, trigger)
+        if wait > 0:
+            log.info(f"[SIM] Attente {wait}s...")
+            time.sleep(wait)
+
+    print("\n" + "═"*60)
+    print("SCÉNARIO TERMINÉ")
+    print("═"*60)
+
+def run_scenario_usb():
+    """
+    Simule une session LumaBooth complète via USB Serial.
+    """
+    print("\n" + "═"*60)
+    print("SCÉNARIO AUTOMATIQUE USB")
+    print("═"*60)
+
+    steps = [
+        ("initial accueil",    0, "initial",      2),
+        ("template change",    1, "index_change", 2),
+        ("template change",    3, "index_change", 2),
+        ("session photo",     -1, "in_session",   3),
+        ("reset accueil",      0, "reset_idle",   2),
+        ("off",               -2, "off",          0),
+    ]
+
+    for label, idx, trigger, wait in steps:
+        print(f"\n  ▶ {label}")
+        if idx == -1:
+            log.info(f"[SIM] {label} — aucune commande LED envoyée")
+        elif idx == -2:
+            action_off_usb()
+        else:
+            action_effect_usb(idx, trigger)
+        if wait > 0:
+            log.info(f"[SIM] Attente {wait}s...")
+            time.sleep(wait)
+
+    print("\n" + "═"*60)
+    print("SCÉNARIO TERMINÉ")
+    print("═"*60)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MENU
+# ─────────────────────────────────────────────────────────────────────────────
+
+MENU = """
+╔═══════════════════════════════════════════════════════════╗
+║   LumaBooth ESP32 Color Simulator — Windows               ║
+║   ESP32  : {esp32_url:<47}║
+║   Port   : {port:<47}║
+║   API    : {api_url:<47}║
+╠═══════════════════════════════════════════════════════════╣
+║  ─── HTTP LOCAL ─────────────────────────────────────── ║
+║   1. Tester ping HTTP                                     ║
+║   2. Effect 1 rouge   via HTTP                            ║
+║   3. Effect 2 vert    via HTTP                            ║
+║   4. Effect 3 bleu    via HTTP                            ║
+║   5. Effect 4 jaune   via HTTP                            ║
+║   6. Reset accueil (Effect 1) via HTTP                    ║
+║   7. Off via HTTP                                         ║
+║  ─── USB SERIAL ─────────────────────────────────────── ║
+║   8. Lister ports COM disponibles                         ║
+║   9. Connecter port USB                                   ║
+║  10. Effect 1 rouge   via USB                             ║
+║  11. Effect 2 vert    via USB                             ║
+║  12. Effect 3 bleu    via USB                             ║
+║  13. Effect 4 jaune   via USB                             ║
+║  14. Off via USB                                          ║
+║  15. Statut ESP32 via USB                                 ║
+║  ─── SCÉNARIOS ──────────────────────────────────────── ║
+║  16. Scénario automatique HTTP                            ║
+║  17. Scénario automatique USB                             ║
+║  ─── CONFIG ESP32 ───────────────────────────────────── ║
+║  18. Changer IP ESP32                                     ║
+║  ─── API DISTANTE ───────────────────────────────────── ║
+║  19. Configurer API distante via HTTP                     ║
+║  20. Configurer API distante via USB                      ║
+║  21. Mode local_push via HTTP                             ║
+║  22. Mode api_pull   via HTTP                             ║
+║  23. Mode dual       via HTTP                             ║
+║  24. Mode local_push via USB                              ║
+║  25. Mode api_pull   via USB                              ║
+║  26. Mode dual       via USB                              ║
+║  27. Modifier URL API distante                            ║
+║  28. Afficher configuration actuelle ESP32                ║
+║   0. Quitter                                              ║
+╚═══════════════════════════════════════════════════════════╝
+"""
+
+def show_menu():
+    port_status = (_serial_conn.port if _serial_conn and _serial_conn.is_open
+                   else SERIAL_PORT + " (non connecté)")
+    api_display = API_URL[:45] + "…" if len(API_URL) > 47 else API_URL
+    print(MENU.format(
+        esp32_url=ESP32_URL,
+        port=port_status,
+        api_url=api_display,
+    ))
+
+def run():
+    global ESP32_URL, SERIAL_PORT, _serial_conn
+    global API_URL, API_INTERVAL_MS, DIRECT_PRIORITY_MS
+    global USB_PRIORITY_MS, ALLOW_HTTP_DURING_USB_PRIORITY
+
+    print("\n" + "═"*60)
+    print("  LumaBooth ESP32 Color Simulator")
+    print(f"  ESP32 cible : {ESP32_URL}")
+    print(f"  Port USB    : {SERIAL_PORT}")
+    print("═"*60)
+
+    while True:
+        show_menu()
+        try:
+            choice = input("Choix > ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAu revoir.")
+            break
+
+        if choice == "0":
+            print("Au revoir.")
+            break
+
+        elif choice == "1":
+            action_ping_http()
+
+        elif choice == "2":
+            action_effect_http(0)
+
+        elif choice == "3":
+            action_effect_http(1)
+
+        elif choice == "4":
+            action_effect_http(2)
+
+        elif choice == "5":
+            action_effect_http(3)
+
+        elif choice == "6":
+            action_effect_http(0, trigger="reset_idle")
+
+        elif choice == "7":
+            action_off_http()
+
+        elif choice == "8":
+            ports = list_serial_ports()
+            if ports:
+                print(f"\nPorts COM disponibles : {', '.join(ports)}")
+            else:
+                print("\nAucun port COM détecté.")
+
+        elif choice == "9":
+            ports = list_serial_ports()
+            if ports:
+                print(f"Ports disponibles : {', '.join(ports)}")
+            suggestion = ports[0] if ports else SERIAL_PORT
+            port_input = input(f"Port à utiliser [{suggestion}] : ").strip()
+            SERIAL_PORT = port_input or suggestion
+            serial_connect(SERIAL_PORT)
+
+        elif choice == "10":
+            action_effect_usb(0)
+
+        elif choice == "11":
+            action_effect_usb(1)
+
+        elif choice == "12":
+            action_effect_usb(2)
+
+        elif choice == "13":
+            action_effect_usb(3)
+
+        elif choice == "14":
+            action_off_usb()
+
+        elif choice == "15":
+            action_status_usb()
+
+        elif choice == "16":
+            run_scenario_http()
+
+        elif choice == "17":
+            run_scenario_usb()
+
+        elif choice == "18":
+            new_url = input(f"Nouvelle IP/URL ESP32 [{ESP32_URL}] : ").strip()
+            if new_url:
+                ESP32_URL = new_url.rstrip("/")
+                log.info(f"ESP32 URL changée : {ESP32_URL}")
+
+        elif choice == "19":
+            action_config_api_http()
+
+        elif choice == "20":
+            action_config_api_usb()
+
+        elif choice == "21":
+            action_set_mode_http("local_push")
+
+        elif choice == "22":
+            action_set_mode_http("api_pull")
+
+        elif choice == "23":
+            action_set_mode_http("dual")
+
+        elif choice == "24":
+            action_set_mode_usb("local_push")
+
+        elif choice == "25":
+            action_set_mode_usb("api_pull")
+
+        elif choice == "26":
+            action_set_mode_usb("dual")
+
+        elif choice == "27":
+            new_api = input(f"Nouvelle URL API [{API_URL}] : ").strip()
+            if new_api:
+                API_URL = new_api.rstrip("/")
+                log.info(f"API URL changée : {API_URL}")
+            vi = input(f"Intervalle polling ms [{API_INTERVAL_MS}] : ").strip()
+            if vi:
+                try:
+                    API_INTERVAL_MS = int(vi)
+                except ValueError:
+                    log.error("Valeur invalide, intervalle inchangé.")
+
+        elif choice == "28":
+            action_show_esp32_status()
+
+        else:
+            print("Choix invalide.")
+
+    # Fermeture propre
+    if _serial_conn and _serial_conn.is_open:
+        _serial_conn.close()
+        log.info("Port série fermé.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POINT D'ENTRÉE
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    run()
+
